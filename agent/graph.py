@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import TypedDict, Optional
 
 from langgraph.graph import StateGraph, END
+from agent.razorpay_client import fetch_payment_status, create_recovery_payment_link, is_live
 
 MAX_AUTO_ACTION_AMOUNT = 15000  # INR — above this, always escalate to human
 MAX_AUTOMATED_ATTEMPTS = 2
@@ -97,50 +98,80 @@ def select_intervention(state: RecoveryState) -> RecoveryState:
     return state
 
 
+# Interventions that actually go out via a payment link (real Razorpay
+# test-mode API call when keys are configured, simulated otherwise).
+LINK_BASED_INTERVENTIONS = {
+    "send_reminder_nudge",
+    "suggest_alt_method",
+    "send_remandate_link",
+    "send_checkout_recovery_link",
+}
+
+# Estimated real-world recovery likelihood by intervention type. This is
+# reported separately from the API call outcome (link created/not) because
+# whether a customer actually completes payment after receiving a link
+# happens asynchronously in reality -- we simulate that downstream outcome
+# for batch-level metrics, clearly labeled as an estimate.
+RECOVERY_LIKELIHOOD = {
+    "auto_retry_payment": 0.55,
+    "send_reminder_nudge": 0.35,
+    "suggest_alt_method": 0.45,
+    "send_remandate_link": 0.30,
+    "send_checkout_recovery_link": 0.25,
+}
+
+
 def execute_bounded_action(state: RecoveryState) -> RecoveryState:
-    """
-    In test-mode this simulates the Razorpay API call rather than hitting
-    production. Swap `simulate_action` for a real Razorpay test-mode SDK
-    call (create_payment_link, retry order, etc.) when wired up live.
-    """
     event = state["event"]
     intervention = state["intervention"]
 
     if state["escalated"]:
         result = {"status": "escalated", "detail": "queued for human agent review"}
-        recovered = None  # unresolved by automation, pending human
+        state["action_result"] = result
+        state["recovered"] = None
+        state["reasoning"].append(f"Executed action -> {result}")
+        return state
+
+    api_mode = "razorpay_test_mode_live" if is_live() else "simulated"
+
+    if intervention == "auto_retry_payment":
+        # Diagnostic real API call: check current payment status before
+        # deciding the retry outcome.
+        status_check = fetch_payment_status(event.get("order_id", "unknown"))
+        result = {
+            "action": "auto_retry_payment",
+            "api_mode": api_mode,
+            "status_check": status_check,
+        }
+    elif intervention in LINK_BASED_INTERVENTIONS:
+        link_result = create_recovery_payment_link(
+            amount_inr=event["amount_inr"],
+            customer_id=event["customer_id"],
+            order_id=event["order_id"],
+            description=f"Recovery: {intervention}",
+        )
+        result = {
+            "action": intervention,
+            "api_mode": api_mode,
+            "payment_link": link_result,
+        }
     else:
-        result = simulate_action(intervention, event)
-        recovered = result["status"] == "recovered"
+        result = {"action": intervention, "api_mode": api_mode, "detail": "no automated action defined"}
+
+    # Simulated downstream business outcome (whether the customer actually
+    # completes payment) -- reported separately and honestly as an estimate,
+    # not conflated with whether the API call itself succeeded.
+    import random
+    rate = RECOVERY_LIKELIHOOD.get(intervention, 0.0)
+    recovered = random.random() < rate
+    result["estimated_outcome"] = "recovered" if recovered else "not_recovered"
+    result["order_id"] = event["order_id"]
+    result["amount_inr"] = event["amount_inr"]
 
     state["action_result"] = result
     state["recovered"] = recovered
-    state["reasoning"].append(f"Executed action -> {result}")
+    state["reasoning"].append(f"Executed action ({api_mode}) -> {result}")
     return state
-
-
-def simulate_action(intervention: str, event: dict) -> dict:
-    """
-    Deterministic-ish simulation standing in for the real Razorpay test-mode
-    call, so the demo has reproducible, explainable outcomes. Recovery
-    likelihood varies by intervention type based on real-world plausibility.
-    """
-    import random
-    success_rates = {
-        "auto_retry_payment": 0.55,
-        "send_reminder_nudge": 0.35,
-        "suggest_alt_method": 0.45,
-        "send_remandate_link": 0.30,
-        "send_checkout_recovery_link": 0.25,
-    }
-    rate = success_rates.get(intervention, 0.0)
-    success = random.random() < rate
-    return {
-        "status": "recovered" if success else "not_recovered",
-        "intervention": intervention,
-        "order_id": event["order_id"],
-        "amount_inr": event["amount_inr"],
-    }
 
 
 def audit_log(state: RecoveryState) -> RecoveryState:
@@ -180,9 +211,13 @@ def build_graph():
 
 
 def run_batch(events: list[dict]) -> list[dict]:
+    from agent.razorpay_client import is_live
+    import time as _time
+
     app = build_graph()
     results = []
-    for event in events:
+    live = is_live()
+    for i, event in enumerate(events):
         init_state: RecoveryState = {
             "event": event,
             "root_cause": None,
@@ -194,6 +229,10 @@ def run_batch(events: list[dict]) -> list[dict]:
         }
         final_state = app.invoke(init_state)
         results.append(final_state)
+        # Pace real API calls to stay under Razorpay test-mode rate limits.
+        # Simulation mode doesn't need this.
+        if live and i < len(events) - 1:
+            _time.sleep(1.5)
     return results
 
 

@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+.env
+logs/audit_log.jsonl
+.streamlit/
