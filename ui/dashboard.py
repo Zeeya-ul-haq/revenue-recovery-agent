@@ -9,7 +9,8 @@ import streamlit as st
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from agent.graph import run_batch  # noqa: E402
-from agent.razorpay_client import is_live  # noqa: E402
+from agent.razorpay_client import is_live as razorpay_is_live  # noqa: E402
+from agent.llm_classifier import is_live as llm_is_live  # noqa: E402
 
 DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "events.json")
 
@@ -17,10 +18,17 @@ st.set_page_config(page_title="AI Revenue Recovery Agent", layout="wide")
 st.title("💸 AI Revenue Recovery Agent")
 st.caption("Detects at-risk payments → diagnoses root cause → executes a bounded, auditable recovery action")
 
-if is_live():
-    st.success("🟢 Connected to Razorpay test-mode API — actions create real test payment links.", icon="✅")
-else:
-    st.info("⚪ Running in simulation mode — no Razorpay keys detected. Add keys to `.env` for live test-mode calls.", icon="ℹ️")
+badge_col1, badge_col2 = st.columns(2)
+with badge_col1:
+    if razorpay_is_live():
+        st.success("🟢 Razorpay test-mode API connected", icon="✅")
+    else:
+        st.info("⚪ Razorpay: simulation mode (no keys)", icon="ℹ️")
+with badge_col2:
+    if llm_is_live():
+        st.success("🟢 LLM classifier connected (Groq)", icon="✅")
+    else:
+        st.info("⚪ Classifier: rule-based fallback (no key)", icon="ℹ️")
 
 if not os.path.exists(DATA_PATH):
     st.error("No event data found. Run `python data/generate_events.py` first.")
@@ -43,6 +51,8 @@ for o in outcomes:
         "amount_inr": o["event"]["amount_inr"],
         "reason_code": o["event"]["reason_code"],
         "root_cause": o["root_cause"],
+        "classifier": o.get("classification_source", "—"),
+        "confidence": o.get("classification_confidence"),
         "intervention": o["intervention"],
         "escalated": o["escalated"],
         "recovered": o["recovered"],

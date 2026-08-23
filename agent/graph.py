@@ -18,6 +18,7 @@ from typing import TypedDict, Optional
 
 from langgraph.graph import StateGraph, END
 from agent.razorpay_client import fetch_payment_status, create_recovery_payment_link, is_live
+from agent.llm_classifier import classify_with_llm
 
 MAX_AUTO_ACTION_AMOUNT = 15000  # INR — above this, always escalate to human
 MAX_AUTOMATED_ATTEMPTS = 2
@@ -29,6 +30,8 @@ AUDIT_LOG_PATH = os.path.join(os.path.dirname(__file__), "..", "logs", "audit_lo
 class RecoveryState(TypedDict):
     event: dict
     root_cause: Optional[str]
+    classification_confidence: Optional[float]
+    classification_source: Optional[str]
     intervention: Optional[str]
     action_result: Optional[dict]
     escalated: bool
@@ -37,18 +40,14 @@ class RecoveryState(TypedDict):
 
 
 # ---------- Root cause taxonomy ----------
-# Maps raw gateway/webhook reason codes to a small set of actionable buckets.
-ROOT_CAUSE_MAP = {
-    "insufficient_funds": "user_side_funds",
-    "card_declined": "user_side_instrument",
-    "upi_mandate_expired": "user_side_mandate",
-    "otp_not_entered": "user_abandonment",
-    "payment_method_not_selected": "user_abandonment",
-    "session_timeout": "user_abandonment",
-    "bank_timeout": "bank_side_transient",
-    "gateway_error": "gateway_side_transient",
-    "risk_engine_block": "risk_hold",
-}
+# Classification itself now happens via LLM (agent/llm_classifier.py), with
+# a rule-based fallback baked into that module. This dict is no longer used
+# directly here -- kept as documentation of the valid root-cause vocabulary.
+_VALID_ROOT_CAUSES_REFERENCE = [
+    "user_side_funds", "user_side_instrument", "user_side_mandate",
+    "user_abandonment", "bank_side_transient", "gateway_side_transient",
+    "risk_hold", "unknown",
+]
 
 # Root cause -> chosen intervention (deterministic policy; the "explainable" part)
 INTERVENTION_POLICY = {
@@ -64,10 +63,14 @@ INTERVENTION_POLICY = {
 
 def classify_root_cause(state: RecoveryState) -> RecoveryState:
     event = state["event"]
-    cause = ROOT_CAUSE_MAP.get(event["reason_code"], "unknown")
-    state["root_cause"] = cause
+    result = classify_with_llm(event)
+    state["root_cause"] = result["root_cause"]
+    state["classification_confidence"] = result["confidence"]
+    state["classification_source"] = result["source"]
     state["reasoning"].append(
-        f"Classified reason_code='{event['reason_code']}' -> root_cause='{cause}'"
+        f"[{result['source']}] reason_code='{event['reason_code']}' -> "
+        f"root_cause='{result['root_cause']}' (confidence={result['confidence']:.2f}) "
+        f"-- {result['reasoning']}"
     )
     return state
 
@@ -182,6 +185,8 @@ def audit_log(state: RecoveryState) -> RecoveryState:
         "customer_id": state["event"]["customer_id"],
         "amount_inr": state["event"]["amount_inr"],
         "root_cause": state["root_cause"],
+        "classification_confidence": state["classification_confidence"],
+        "classification_source": state["classification_source"],
         "intervention": state["intervention"],
         "escalated": state["escalated"],
         "recovered": state["recovered"],
@@ -211,16 +216,24 @@ def build_graph():
 
 
 def run_batch(events: list[dict]) -> list[dict]:
-    from agent.razorpay_client import is_live
+    from agent.razorpay_client import is_live as razorpay_live
+    from agent.llm_classifier import is_live as llm_live
     import time as _time
 
     app = build_graph()
     results = []
-    live = is_live()
+    razorpay_live_mode = razorpay_live()
+    llm_live_mode = llm_live()
+    # Pace whichever live API is in play; if both are live, the larger
+    # delay covers both since they happen sequentially within one event.
+    delay = 1.5 if razorpay_live_mode else (0.3 if llm_live_mode else 0)
+
     for i, event in enumerate(events):
         init_state: RecoveryState = {
             "event": event,
             "root_cause": None,
+            "classification_confidence": None,
+            "classification_source": None,
             "intervention": None,
             "action_result": None,
             "escalated": False,
@@ -229,10 +242,8 @@ def run_batch(events: list[dict]) -> list[dict]:
         }
         final_state = app.invoke(init_state)
         results.append(final_state)
-        # Pace real API calls to stay under Razorpay test-mode rate limits.
-        # Simulation mode doesn't need this.
-        if live and i < len(events) - 1:
-            _time.sleep(1.5)
+        if delay and i < len(events) - 1:
+            _time.sleep(delay)
     return results
 
 

@@ -97,11 +97,12 @@ def create_recovery_payment_link(amount_inr: float, customer_id: str, order_id: 
     amount_paise = int(round(amount_inr * 100))  # Razorpay uses paise
 
     if LIVE_MODE:
+        unique_ref = f"{order_id}-{uuid.uuid4().hex[:8]}"
         payload = {
             "amount": amount_paise,
             "currency": "INR",
             "description": f"{description} (order {order_id})",
-            "reference_id": order_id,
+            "reference_id": unique_ref,
             "notes": {"customer_id": customer_id, "order_id": order_id},
         }
         result, error = _call_with_retry(_client.payment_link.create, payload)
