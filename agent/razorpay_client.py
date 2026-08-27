@@ -97,6 +97,9 @@ def create_recovery_payment_link(amount_inr: float, customer_id: str, order_id: 
     amount_paise = int(round(amount_inr * 100))  # Razorpay uses paise
 
     if LIVE_MODE:
+        # Unique reference_id per call -- Razorpay rejects duplicates, and
+        # since the same synthetic order_id gets replayed across batch runs
+        # during development/demos, a raw order_id alone isn't safe to reuse.
         unique_ref = f"{order_id}-{uuid.uuid4().hex[:8]}"
         payload = {
             "amount": amount_paise,

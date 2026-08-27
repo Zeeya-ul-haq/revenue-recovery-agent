@@ -24,6 +24,12 @@ MAX_AUTO_ACTION_AMOUNT = 15000  # INR — above this, always escalate to human
 MAX_AUTOMATED_ATTEMPTS = 2
 COOLDOWN_MINUTES = 30
 
+# Bumped whenever the gating rules or intervention policy change. Every
+# audit log entry records which policy version made the decision, so a
+# compliance review can distinguish "old rule, now-fixed" from "current
+# rule" when scanning historical entries.
+POLICY_VERSION = "1.1"
+
 AUDIT_LOG_PATH = os.path.join(os.path.dirname(__file__), "..", "logs", "audit_log.jsonl")
 
 
@@ -36,6 +42,8 @@ class RecoveryState(TypedDict):
     action_result: Optional[dict]
     escalated: bool
     recovered: Optional[bool]
+    would_have_self_recovered: Optional[bool]
+    incremental_recovery: Optional[bool]
     reasoning: list
 
 
@@ -123,6 +131,21 @@ RECOVERY_LIKELIHOOD = {
     "send_checkout_recovery_link": 0.25,
 }
 
+# Baseline self-recovery rate: the estimated probability a customer would
+# have completed payment WITHOUT any agent intervention (returns on their
+# own, retries the card themselves, etc). This is the counterfactual used
+# to compute genuine incremental recovery -- i.e. money the agent actually
+# caused, not money that would have come back anyway. Only meaningful for
+# link-based (customer-facing) interventions; auto_retry_payment has no
+# customer-side counterfactual since the retry itself IS the mechanism,
+# not a nudge toward independent action.
+BASELINE_SELF_RECOVERY_RATE = {
+    "send_reminder_nudge": 0.08,          # some customers top up funds on their own anyway
+    "suggest_alt_method": 0.05,
+    "send_remandate_link": 0.03,          # mandate re-auth is unlikely without a link
+    "send_checkout_recovery_link": 0.12,  # some abandoners return to complete checkout unprompted
+}
+
 
 def execute_bounded_action(state: RecoveryState) -> RecoveryState:
     event = state["event"]
@@ -167,19 +190,46 @@ def execute_bounded_action(state: RecoveryState) -> RecoveryState:
     import random
     rate = RECOVERY_LIKELIHOOD.get(intervention, 0.0)
     recovered = random.random() < rate
+
+    # Counterfactual: would this customer have paid anyway, with no agent
+    # action at all? Only computed for customer-facing (link-based)
+    # interventions -- this is what makes the recovery number honest rather
+    # than a raw "recovered" count that silently takes credit for payments
+    # that would have happened regardless.
+    would_have_self_recovered = None
+    incremental_recovery = None
+    if intervention in LINK_BASED_INTERVENTIONS:
+        baseline_rate = BASELINE_SELF_RECOVERY_RATE.get(intervention, 0.0)
+        would_have_self_recovered = random.random() < baseline_rate
+        if recovered:
+            # Real value add only if the customer would NOT have paid on
+            # their own -- this is the "false positive intervention" check
+            # the honesty-metrics bar asks for.
+            incremental_recovery = not would_have_self_recovered
+
     result["estimated_outcome"] = "recovered" if recovered else "not_recovered"
     result["order_id"] = event["order_id"]
     result["amount_inr"] = event["amount_inr"]
 
     state["action_result"] = result
     state["recovered"] = recovered
+    state["would_have_self_recovered"] = would_have_self_recovered
+    state["incremental_recovery"] = incremental_recovery
     state["reasoning"].append(f"Executed action ({api_mode}) -> {result}")
+    if recovered and would_have_self_recovered is not None:
+        note = (
+            "genuine incremental recovery (customer would not have paid without this action)"
+            if incremental_recovery
+            else "FALSE-POSITIVE intervention (customer likely would have paid anyway -- no real credit)"
+        )
+        state["reasoning"].append(f"Counterfactual check: {note}")
     return state
 
 
 def audit_log(state: RecoveryState) -> RecoveryState:
     entry = {
         "timestamp": datetime.now().isoformat(),
+        "policy_version": POLICY_VERSION,
         "event_id": state["event"]["event_id"],
         "order_id": state["event"]["order_id"],
         "customer_id": state["event"]["customer_id"],
@@ -189,7 +239,15 @@ def audit_log(state: RecoveryState) -> RecoveryState:
         "classification_source": state["classification_source"],
         "intervention": state["intervention"],
         "escalated": state["escalated"],
+        # Populated later by a human reviewer picking up an escalated case;
+        # null means "not yet reviewed" -- distinct from "no review needed"
+        # (non-escalated cases), which never gets this field set at all
+        # by automation. A real ops team would update this via a separate
+        # review workflow, not this pipeline.
+        "human_reviewer": None,
         "recovered": state["recovered"],
+        "would_have_self_recovered": state["would_have_self_recovered"],
+        "incremental_recovery": state["incremental_recovery"],
         "reasoning_trace": state["reasoning"],
         "action_result": state["action_result"],
     }
@@ -238,6 +296,8 @@ def run_batch(events: list[dict]) -> list[dict]:
             "action_result": None,
             "escalated": False,
             "recovered": None,
+            "would_have_self_recovered": None,
+            "incremental_recovery": None,
             "reasoning": [],
         }
         final_state = app.invoke(init_state)
@@ -251,12 +311,28 @@ if __name__ == "__main__":
     with open(os.path.join(os.path.dirname(__file__), "..", "data", "events.json")) as f:
         events = json.load(f)
     outcomes = run_batch(events)
-    total_recovered = sum(
-        o["event"]["amount_inr"] for o in outcomes if o["recovered"]
-    )
+
     total_at_risk = sum(o["event"]["amount_inr"] for o in outcomes)
+    total_recovered = sum(o["event"]["amount_inr"] for o in outcomes if o["recovered"])
     escalated_count = sum(1 for o in outcomes if o["escalated"])
+
+    incremental_recovered = sum(
+        o["event"]["amount_inr"] for o in outcomes if o.get("incremental_recovery") is True
+    )
+    false_positive_recovered = sum(
+        o["event"]["amount_inr"] for o in outcomes
+        if o.get("recovered") and o.get("incremental_recovery") is False
+    )
+    false_positive_count = sum(
+        1 for o in outcomes if o.get("recovered") and o.get("incremental_recovery") is False
+    )
+
     print(f"Events processed: {len(outcomes)}")
     print(f"Total at risk: ₹{total_at_risk:,.2f}")
-    print(f"Total recovered: ₹{total_recovered:,.2f}")
     print(f"Escalated to human: {escalated_count}")
+    print()
+    print(f"Total recovered (gross): ₹{total_recovered:,.2f}")
+    print(f"  Genuine incremental recovery: ₹{incremental_recovered:,.2f}  <- money the agent actually caused")
+    print(f"  False-positive interventions: ₹{false_positive_recovered:,.2f} across {false_positive_count} orders  <- would have paid anyway, agent gets no real credit")
+    if total_recovered > 0:
+        print(f"  Honest recovery rate (incremental / gross): {incremental_recovered / total_recovered:.1%}")

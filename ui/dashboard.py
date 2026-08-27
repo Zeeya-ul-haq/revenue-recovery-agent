@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from agent.graph import run_batch  # noqa: E402
+from agent.graph import run_batch, POLICY_VERSION  # noqa: E402
 from agent.razorpay_client import is_live as razorpay_is_live  # noqa: E402
 from agent.llm_classifier import is_live as llm_is_live  # noqa: E402
 
@@ -56,6 +56,8 @@ for o in outcomes:
         "intervention": o["intervention"],
         "escalated": o["escalated"],
         "recovered": o["recovered"],
+        "would_have_self_recovered": o.get("would_have_self_recovered"),
+        "incremental_recovery": o.get("incremental_recovery"),
     })
 df = pd.DataFrame(rows)
 
@@ -65,14 +67,42 @@ escalated_count = int(df["escalated"].sum())
 auto_actioned = len(df) - escalated_count
 recovery_rate = (df["recovered"] == True).sum() / max(auto_actioned, 1)
 
+incremental_recovered = df.loc[df["incremental_recovery"] == True, "amount_inr"].sum()
+false_positive_recovered = df.loc[
+    (df["recovered"] == True) & (df["incremental_recovery"] == False), "amount_inr"
+].sum()
+false_positive_count = int(
+    ((df["recovered"] == True) & (df["incremental_recovery"] == False)).sum()
+)
+honest_rate = (incremental_recovered / total_recovered) if total_recovered > 0 else 0
+
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Total at risk", f"₹{total_at_risk:,.0f}")
-c2.metric("Recovered", f"₹{total_recovered:,.0f}", f"{total_recovered/total_at_risk:.1%} of at-risk")
+c2.metric("Recovered (gross)", f"₹{total_recovered:,.0f}", f"{total_recovered/total_at_risk:.1%} of at-risk")
 c3.metric("Escalated to human", escalated_count)
 c4.metric("Auto-recovery rate", f"{recovery_rate:.1%}")
 
+st.subheader("Honest impact — was the recovery real?")
+st.caption(
+    "Gross 'recovered' includes customers who may have paid anyway with no intervention. "
+    "These numbers separate genuine incremental recovery (the agent's real causal impact) "
+    "from false-positive interventions (recovered, but the agent likely gets no real credit)."
+)
+h1, h2, h3 = st.columns(3)
+h1.metric("Genuine incremental recovery", f"₹{incremental_recovered:,.0f}")
+h2.metric("False-positive interventions", f"₹{false_positive_recovered:,.0f}", f"{false_positive_count} orders", delta_color="inverse")
+h3.metric("Honest recovery rate", f"{honest_rate:.1%}", "incremental / gross")
+
 st.subheader("Batch results")
 st.dataframe(df, width="stretch")
+
+csv_bytes = df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    "⬇ Export batch as CSV (compliance/audit report)",
+    data=csv_bytes,
+    file_name=f"recovery_batch_report.csv",
+    mime="text/csv",
+)
 
 st.subheader("Intervention breakdown")
 st.bar_chart(df["intervention"].value_counts())
@@ -80,6 +110,7 @@ st.bar_chart(df["intervention"].value_counts())
 st.subheader("Audit trail (reasoning per decision)")
 selected_order = st.selectbox("Inspect an order", df["order_id"])
 match = next(o for o in outcomes if o["event"]["order_id"] == selected_order)
+st.caption(f"Policy version: `{POLICY_VERSION}` — human_reviewer: `None` (pre-review; set only after a human picks up an escalated case)")
 for step in match["reasoning"]:
     st.write("• " + step)
 st.json(match["action_result"])
