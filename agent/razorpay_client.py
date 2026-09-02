@@ -135,14 +135,23 @@ def create_recovery_payment_link(amount_inr: float, customer_id: str, order_id: 
                 "short_url": result.get("short_url"),
                 "payment_link_id": result.get("id"),
             }
-        return {
-            "source": "razorpay_live_test_mode_error",
-            "status": "link_creation_failed",
-            "error": str(error),
-        }
-    # simulation fallback -- either no keys configured, or this run's live
-    # quota is used up. Labeled distinctly so the audit trail is honest
-    # about which path produced this result.
+        if "test mode limit" in str(error).lower():
+            # The account-wide lifetime cap (30 links, ever) was already
+            # exhausted before this run started, so the live attempt failed
+            # even though we were still under this run's own counter. Don't
+            # surface the raw error -- fall through to the honestly-labeled
+            # simulation below, same as when the per-run cap is hit.
+            pass
+        else:
+            return {
+                "source": "razorpay_live_test_mode_error",
+                "status": "link_creation_failed",
+                "error": str(error),
+            }
+    # simulation fallback -- either no keys configured, this run's live
+    # quota is used up, or the account's lifetime cap was already exhausted.
+    # Labeled distinctly so the audit trail is honest about which path
+    # produced this result.
     source = "simulated_live_cap_reached" if LIVE_MODE else "simulated"
     return {
         "source": source,
