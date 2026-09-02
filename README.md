@@ -1,4 +1,4 @@
-# AI Revenue Recovery Agent
+# Recoup
 
 A LangGraph agent that detects at-risk payments (failures, drop-offs, expired mandates), diagnoses the root cause using an LLM, and executes a bounded, auditable recovery action via Razorpay's test-mode API.
 

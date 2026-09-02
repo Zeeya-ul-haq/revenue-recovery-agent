@@ -14,8 +14,8 @@ from agent.llm_classifier import is_live as llm_is_live  # noqa: E402
 
 DATA_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "events.json")
 
-st.set_page_config(page_title="AI Revenue Recovery Agent", layout="wide")
-st.title("💸 AI Revenue Recovery Agent")
+st.set_page_config(page_title="Recoup", layout="wide")
+st.title("Recoup")
 st.caption("Detects at-risk payments → diagnoses root cause → executes a bounded, auditable recovery action")
 
 badge_col1, badge_col2 = st.columns(2)
