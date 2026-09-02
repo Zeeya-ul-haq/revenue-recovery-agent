@@ -33,6 +33,14 @@ if LIVE_MODE:
 MAX_RETRIES = 5
 BASE_BACKOFF_SECONDS = 4
 
+# Razorpay test-mode accounts have a hard lifetime cap on payment links
+# (observed: 30 total). Rather than burn through that quota every batch
+# run -- and fail loudly once it's gone -- only the first N calls per
+# process go live; the rest simulate, clearly labeled, so a demo or batch
+# run never breaks partway through regardless of how much quota is left.
+MAX_LIVE_LINK_CALLS_PER_RUN = 5
+_live_link_calls_made = 0
+
 
 def _call_with_retry(fn, *args, **kwargs):
     """
@@ -40,6 +48,12 @@ def _call_with_retry(fn, *args, **kwargs):
     errors ("Too many requests"). Real payment infra always needs this --
     it's not a workaround, it's expected resilience for any system that
     calls a rate-limited external API in a batch.
+
+    Some errors are NOT retryable no matter how long you wait -- e.g.
+    Razorpay test-mode accounts have a fixed lifetime cap on payment links
+    ("test mode limit of 30 reached"), which is a hard ceiling, not a
+    time-window throttle. Retrying that just burns time for no benefit,
+    so it's treated as fail-fast instead of rate-limit-and-retry.
     """
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
@@ -48,6 +62,9 @@ def _call_with_retry(fn, *args, **kwargs):
         except Exception as e:
             last_error = e
             msg = str(e).lower()
+            if "test mode limit" in msg:
+                # Hard account ceiling -- backoff cannot fix this, fail fast.
+                break
             if "too many requests" in msg or "rate limit" in msg:
                 wait = BASE_BACKOFF_SECONDS * (2 ** (attempt - 1))  # 4, 8, 16, 32, 64
                 time.sleep(wait)
@@ -92,11 +109,13 @@ def create_recovery_payment_link(amount_inr: float, customer_id: str, order_id: 
     """
     Creates a real Razorpay test-mode payment link the customer could click
     and pay through Razorpay's test checkout, OR a simulated link if no
-    keys are configured.
+    keys are configured, or once this run's live-call cap is reached.
     """
+    global _live_link_calls_made
     amount_paise = int(round(amount_inr * 100))  # Razorpay uses paise
 
-    if LIVE_MODE:
+    if LIVE_MODE and _live_link_calls_made < MAX_LIVE_LINK_CALLS_PER_RUN:
+        _live_link_calls_made += 1
         # Unique reference_id per call -- Razorpay rejects duplicates, and
         # since the same synthetic order_id gets replayed across batch runs
         # during development/demos, a raw order_id alone isn't safe to reuse.
@@ -121,9 +140,12 @@ def create_recovery_payment_link(amount_inr: float, customer_id: str, order_id: 
             "status": "link_creation_failed",
             "error": str(error),
         }
-    # simulation fallback
+    # simulation fallback -- either no keys configured, or this run's live
+    # quota is used up. Labeled distinctly so the audit trail is honest
+    # about which path produced this result.
+    source = "simulated_live_cap_reached" if LIVE_MODE else "simulated"
     return {
-        "source": "simulated",
+        "source": source,
         "status": "link_created",
         "short_url": f"https://rzp.io/simulated/{uuid.uuid4().hex[:10]}",
         "payment_link_id": f"plink_sim_{uuid.uuid4().hex[:14]}",
